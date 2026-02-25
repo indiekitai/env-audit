@@ -4,39 +4,61 @@ env-audit: Scan a codebase and generate documented .env.example
 
 Scans source files for environment variable references and produces
 a clean, documented template with categories and descriptions.
+
+Features:
+- Multi-language support (Python, Node, Go, Rust, Ruby, Shell, Docker)
+- Smart extraction of default values
+- Required vs optional detection
+- Sensitive variable marking
+- Multiple output formats (env, json, typescript, zod)
+- CI-friendly --check mode
 """
 
 import os
 import re
 import sys
+import json
 import argparse
 from pathlib import Path
 from collections import defaultdict
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Optional
 
-# Patterns to find env var references
+# Patterns to find env var references WITH default value extraction
+# Each tuple: (pattern, language, default_value_group_index_or_None)
 PATTERNS = [
-    # Python: os.environ.get("VAR"), os.getenv("VAR"), os.environ["VAR"]
-    (r'os\.environ\.get\(["\']([A-Z][A-Z0-9_]*)["\']', 'python'),
-    (r'os\.getenv\(["\']([A-Z][A-Z0-9_]*)["\']', 'python'),
-    (r'os\.environ\[["\']([A-Z][A-Z0-9_]*)["\']', 'python'),
-    # Node.js: process.env.VAR, process.env["VAR"]
-    (r'process\.env\.([A-Z][A-Z0-9_]*)', 'javascript'),
-    (r'process\.env\[["\']([A-Z][A-Z0-9_]*)["\']', 'javascript'),
+    # Python: os.environ.get("VAR", "default"), os.getenv("VAR", "default")
+    (r'os\.environ\.get\(["\']([A-Z][A-Z0-9_]*)["\'](?:\s*,\s*["\']([^"\']*)["\'])?\)', 'python', 2),
+    (r'os\.getenv\(["\']([A-Z][A-Z0-9_]*)["\'](?:\s*,\s*["\']([^"\']*)["\'])?\)', 'python', 2),
+    (r'os\.environ\[["\']([A-Z][A-Z0-9_]*)["\']', 'python', None),
+    
+    # Node.js: process.env.VAR || "default", process.env.VAR ?? "default"
+    (r'process\.env\.([A-Z][A-Z0-9_]*)\s*(?:\|\||&&|\?\?)\s*["\']([^"\']*)["\']', 'javascript', 2),
+    (r'process\.env\.([A-Z][A-Z0-9_]*)', 'javascript', None),
+    (r'process\.env\[["\']([A-Z][A-Z0-9_]*)["\']', 'javascript', None),
+    
     # Go: os.Getenv("VAR")
-    (r'os\.Getenv\(["\']([A-Z][A-Z0-9_]*)["\']', 'go'),
+    (r'os\.Getenv\(["\']([A-Z][A-Z0-9_]*)["\']', 'go', None),
+    
     # Rust: std::env::var("VAR"), env::var("VAR")
-    (r'env::var\(["\']([A-Z][A-Z0-9_]*)["\']', 'rust'),
-    # Ruby: ENV["VAR"], ENV.fetch("VAR")
-    (r'ENV\[["\']([A-Z][A-Z0-9_]*)["\']', 'ruby'),
-    (r'ENV\.fetch\(["\']([A-Z][A-Z0-9_]*)["\']', 'ruby'),
-    # Shell/Bash: $VAR, ${VAR}
-    (r'\$\{?([A-Z][A-Z0-9_]*)\}?', 'shell'),
-    # Generic: env("VAR"), getEnv("VAR")
-    (r'(?:get)?[Ee]nv\(["\']([A-Z][A-Z0-9_]*)["\']', 'generic'),
+    (r'env::var\(["\']([A-Z][A-Z0-9_]*)["\']', 'rust', None),
+    
+    # Ruby: ENV["VAR"] || "default", ENV.fetch("VAR", "default")
+    (r'ENV\[["\']([A-Z][A-Z0-9_]*)["\']\]\s*\|\|\s*["\']([^"\']*)["\']', 'ruby', 2),
+    (r'ENV\.fetch\(["\']([A-Z][A-Z0-9_]*)["\'](?:\s*,\s*["\']([^"\']*)["\'])?\)', 'ruby', 2),
+    (r'ENV\[["\']([A-Z][A-Z0-9_]*)["\']', 'ruby', None),
+    
+    # Shell/Bash: ${VAR:-default}, ${VAR:=default}
+    (r'\$\{([A-Z][A-Z0-9_]*):-([^}]*)\}', 'shell', 2),
+    (r'\$\{([A-Z][A-Z0-9_]*):=([^}]*)\}', 'shell', 2),
+    (r'\$\{?([A-Z][A-Z0-9_]*)\}?', 'shell', None),
+    
+    # Generic: env("VAR", "default"), getEnv("VAR")
+    (r'(?:get)?[Ee]nv\(["\']([A-Z][A-Z0-9_]*)["\'](?:\s*,\s*["\']([^"\']*)["\'])?\)', 'generic', 2),
+    
     # Docker/docker-compose
-    (r'^\s*-?\s*([A-Z][A-Z0-9_]*)=', 'docker'),
-    (r'\$\{([A-Z][A-Z0-9_]*)', 'docker'),
+    (r'^\s*-?\s*([A-Z][A-Z0-9_]*)=([^\s]*)', 'docker', 2),
+    (r'\$\{([A-Z][A-Z0-9_]*):-([^}]*)\}', 'docker', 2),
+    (r'\$\{([A-Z][A-Z0-9_]*)', 'docker', None),
 ]
 
 # File extensions to scan
@@ -56,13 +78,22 @@ SKIP_DIRS = {
 # Common env var categories
 CATEGORIES = {
     'database': ['DATABASE', 'DB_', 'POSTGRES', 'MYSQL', 'MONGO', 'REDIS', 'SQL'],
-    'auth': ['AUTH', 'JWT', 'SECRET', 'TOKEN', 'PASSWORD', 'API_KEY', 'OAUTH', 'SESSION'],
+    'auth': ['AUTH', 'JWT', 'SECRET', 'TOKEN', 'PASSWORD', 'API_KEY', 'OAUTH', 'SESSION', 'CREDENTIAL'],
     'api': ['API_', 'ENDPOINT', 'URL', 'HOST', 'PORT', 'BASE_URL'],
     'cloud': ['AWS_', 'GCP_', 'AZURE_', 'S3_', 'CLOUD'],
     'email': ['SMTP', 'EMAIL', 'MAIL', 'SENDGRID', 'SES_'],
     'logging': ['LOG_', 'DEBUG', 'SENTRY', 'NEWRELIC'],
     'feature': ['FEATURE_', 'ENABLE_', 'DISABLE_', 'FLAG_'],
 }
+
+# Keywords that indicate sensitive variables
+SENSITIVE_KEYWORDS = {'SECRET', 'KEY', 'PASSWORD', 'TOKEN', 'CREDENTIAL', 'PRIVATE', 'AUTH'}
+
+
+def is_sensitive(var_name: str) -> bool:
+    """Check if a variable name indicates sensitive data."""
+    var_upper = var_name.upper()
+    return any(kw in var_upper for kw in SENSITIVE_KEYWORDS)
 
 
 def categorize_var(var_name: str) -> str:
@@ -103,8 +134,12 @@ def guess_description(var_name: str, context: str) -> str:
     return f'{words} configuration'
 
 
-def guess_example(var_name: str) -> str:
+def guess_example(var_name: str, default_value: Optional[str] = None) -> str:
     """Guess an example value for the env var."""
+    # If we found a default value in code, use it
+    if default_value:
+        return default_value
+    
     examples = {
         'DATABASE_URL': 'postgresql://user:pass@localhost:5432/dbname',
         'REDIS_URL': 'redis://localhost:6379',
@@ -139,9 +174,9 @@ def guess_example(var_name: str) -> str:
     return ''
 
 
-def scan_file(filepath: Path) -> Dict[str, List[Tuple[int, str]]]:
-    """Scan a file for env var references. Returns {var: [(line_num, context)]}."""
-    results = defaultdict(list)
+def scan_file(filepath: Path) -> Dict[str, Dict]:
+    """Scan a file for env var references. Returns {var: {occurrences, default, ...}}."""
+    results = {}
     
     try:
         content = filepath.read_text(encoding='utf-8', errors='ignore')
@@ -151,15 +186,32 @@ def scan_file(filepath: Path) -> Dict[str, List[Tuple[int, str]]]:
     lines = content.split('\n')
     
     for line_num, line in enumerate(lines, 1):
-        for pattern, lang in PATTERNS:
+        for pattern, lang, default_group in PATTERNS:
             for match in re.finditer(pattern, line):
                 var_name = match.group(1)
+                
                 # Skip very short names or common false positives
                 if len(var_name) < 3:
                     continue
                 if var_name in {'HOME', 'PATH', 'USER', 'SHELL', 'PWD', 'TERM'}:
                     continue
-                results[var_name].append((line_num, line.strip()[:100]))
+                
+                # Extract default value if pattern supports it
+                default_value = None
+                if default_group and len(match.groups()) >= default_group:
+                    default_value = match.group(default_group)
+                
+                if var_name not in results:
+                    results[var_name] = {
+                        'occurrences': [],
+                        'default': None,
+                    }
+                
+                results[var_name]['occurrences'].append((line_num, line.strip()[:100]))
+                
+                # Keep the first non-None default value found
+                if default_value and results[var_name]['default'] is None:
+                    results[var_name]['default'] = default_value
     
     return results
 
@@ -184,7 +236,7 @@ def scan_directory(root: Path) -> Dict[str, Dict]:
             
             file_vars = scan_file(filepath)
             
-            for var_name, occurrences in file_vars.items():
+            for var_name, var_data in file_vars.items():
                 if var_name not in all_vars:
                     all_vars[var_name] = {
                         'name': var_name,
@@ -192,13 +244,23 @@ def scan_directory(root: Path) -> Dict[str, Dict]:
                         'files': [],
                         'occurrences': 0,
                         'context': '',
+                        'default': None,
+                        'required': True,  # Will be set to False if default found
+                        'sensitive': is_sensitive(var_name),
                     }
                 
                 rel_path = filepath.relative_to(root)
                 all_vars[var_name]['files'].append(str(rel_path))
-                all_vars[var_name]['occurrences'] += len(occurrences)
-                if occurrences and not all_vars[var_name]['context']:
-                    all_vars[var_name]['context'] = occurrences[0][1]
+                all_vars[var_name]['occurrences'] += len(var_data['occurrences'])
+                
+                # Update default value (first found wins)
+                if var_data['default'] and all_vars[var_name]['default'] is None:
+                    all_vars[var_name]['default'] = var_data['default']
+                    all_vars[var_name]['required'] = False
+                
+                # Store first context
+                if var_data['occurrences'] and not all_vars[var_name]['context']:
+                    all_vars[var_name]['context'] = var_data['occurrences'][0][1]
     
     return all_vars
 
@@ -252,11 +314,20 @@ def generate_env_example(vars_dict: Dict[str, Dict], existing: Set[str]) -> str:
         for var_info in vars_list:
             name = var_info['name']
             desc = guess_description(name, var_info['context'])
-            example = guess_example(name)
+            example = guess_example(name, var_info['default'])
             
-            status = ""
+            # Build status indicators
+            status_parts = []
             if name in existing:
-                status = " (already defined)"
+                status_parts.append("already defined")
+            if var_info['sensitive']:
+                status_parts.append("sensitive")
+            if not var_info['required']:
+                status_parts.append(f"optional, default: {var_info['default']}")
+            elif var_info['required']:
+                status_parts.append("required")
+            
+            status = f" ({', '.join(status_parts)})" if status_parts else ""
             
             output.append(f"# {desc}{status}")
             output.append(f"# Found in: {', '.join(var_info['files'][:3])}")
@@ -268,6 +339,91 @@ def generate_env_example(vars_dict: Dict[str, Dict], existing: Set[str]) -> str:
     return '\n'.join(output)
 
 
+def generate_typescript(vars_dict: Dict[str, Dict]) -> str:
+    """Generate TypeScript type declarations for env vars."""
+    output = []
+    output.append("// Environment variable types")
+    output.append("// Generated by env-audit")
+    output.append("// https://github.com/indiekitai/env-audit")
+    output.append("")
+    output.append("declare namespace NodeJS {")
+    output.append("  interface ProcessEnv {")
+    
+    for var_info in sorted(vars_dict.values(), key=lambda x: x['name']):
+        name = var_info['name']
+        required = var_info['required']
+        sensitive = var_info['sensitive']
+        desc = guess_description(name, var_info['context'])
+        
+        # Add JSDoc comment
+        comments = [desc]
+        if sensitive:
+            comments.append("@sensitive")
+        if not required:
+            comments.append(f"@default {var_info['default']}")
+        
+        output.append(f"    /** {' | '.join(comments)} */")
+        
+        # Optional vars get `?`
+        optional = "?" if not required else ""
+        output.append(f"    {name}{optional}: string;")
+    
+    output.append("  }")
+    output.append("}")
+    output.append("")
+    output.append("export {};")
+    
+    return '\n'.join(output)
+
+
+def generate_zod(vars_dict: Dict[str, Dict]) -> str:
+    """Generate Zod schema for env var validation."""
+    output = []
+    output.append("// Environment variable validation schema")
+    output.append("// Generated by env-audit")
+    output.append("// https://github.com/indiekitai/env-audit")
+    output.append("")
+    output.append("import { z } from 'zod';")
+    output.append("")
+    output.append("export const envSchema = z.object({")
+    
+    for var_info in sorted(vars_dict.values(), key=lambda x: x['name']):
+        name = var_info['name']
+        required = var_info['required']
+        default = var_info['default']
+        desc = guess_description(name, var_info['context'])
+        
+        # Build zod chain
+        chain = "z.string()"
+        if not required and default:
+            chain += f'.default("{default}")'
+        elif not required:
+            chain += '.optional()'
+        
+        # Add description
+        chain += f'.describe("{desc}")'
+        
+        output.append(f"  {name}: {chain},")
+    
+    output.append("});")
+    output.append("")
+    output.append("export type Env = z.infer<typeof envSchema>;")
+    output.append("")
+    output.append("// Usage: const env = envSchema.parse(process.env);")
+    
+    return '\n'.join(output)
+
+
+def run_check(vars_dict: Dict[str, Dict], existing: Set[str]) -> Tuple[bool, List[str]]:
+    """Check if all env vars are documented. Returns (passed, missing_vars)."""
+    found_vars = set(vars_dict.keys())
+    missing = found_vars - existing
+    
+    # Filter to only required vars for stricter check? 
+    # For now, report all missing vars
+    return len(missing) == 0, sorted(missing)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Scan a codebase for environment variables and generate .env.example'
@@ -276,6 +432,9 @@ def main():
     parser.add_argument('-o', '--output', help='Output file (default: stdout)')
     parser.add_argument('--json', action='store_true', help='Output as JSON')
     parser.add_argument('--stats', action='store_true', help='Show statistics only')
+    parser.add_argument('--check', action='store_true', help='Check mode: exit 1 if undocumented vars exist')
+    parser.add_argument('--format', choices=['env', 'typescript', 'zod'], default='env',
+                        help='Output format (default: env)')
     
     args = parser.parse_args()
     root = Path(args.path).resolve()
@@ -284,14 +443,41 @@ def main():
         print(f"Error: Path '{root}' does not exist", file=sys.stderr)
         sys.exit(1)
     
-    print(f"Scanning {root}...", file=sys.stderr)
+    # Suppress info messages in check mode or json mode
+    quiet = args.check or args.json
+    
+    if not quiet:
+        print(f"Scanning {root}...", file=sys.stderr)
     
     vars_dict = scan_directory(root)
     existing = check_existing_env(root)
     
-    print(f"Found {len(vars_dict)} environment variables", file=sys.stderr)
-    print(f"Already defined: {len(existing)}", file=sys.stderr)
+    if not quiet:
+        print(f"Found {len(vars_dict)} environment variables", file=sys.stderr)
+        print(f"Already defined: {len(existing)}", file=sys.stderr)
+        
+        # Summary of required/optional/sensitive
+        required_count = sum(1 for v in vars_dict.values() if v['required'])
+        sensitive_count = sum(1 for v in vars_dict.values() if v['sensitive'])
+        print(f"Required: {required_count}, Optional: {len(vars_dict) - required_count}, Sensitive: {sensitive_count}", file=sys.stderr)
     
+    # Check mode
+    if args.check:
+        passed, missing = run_check(vars_dict, existing)
+        if not passed:
+            print(f"❌ Found {len(missing)} undocumented environment variables:", file=sys.stderr)
+            for var in missing:
+                info = vars_dict[var]
+                req = "required" if info['required'] else "optional"
+                sens = ", sensitive" if info['sensitive'] else ""
+                print(f"  - {var} ({req}{sens}) in {', '.join(info['files'][:2])}", file=sys.stderr)
+            print(f"\nRun 'env-audit -o .env.example' to generate documentation.", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(f"✅ All {len(vars_dict)} environment variables are documented.", file=sys.stderr)
+            sys.exit(0)
+    
+    # Stats only mode
     if args.stats:
         by_category = defaultdict(int)
         for var_info in vars_dict.values():
@@ -300,11 +486,21 @@ def main():
         print("\nBy category:")
         for cat, count in sorted(by_category.items(), key=lambda x: -x[1]):
             print(f"  {cat}: {count}")
+        
+        print("\nRequired variables:")
+        for var_info in sorted(vars_dict.values(), key=lambda x: x['name']):
+            if var_info['required']:
+                sens = " [SENSITIVE]" if var_info['sensitive'] else ""
+                print(f"  {var_info['name']}{sens}")
         return
     
+    # Generate output based on format
     if args.json:
-        import json
         output = json.dumps(vars_dict, indent=2)
+    elif args.format == 'typescript':
+        output = generate_typescript(vars_dict)
+    elif args.format == 'zod':
+        output = generate_zod(vars_dict)
     else:
         output = generate_env_example(vars_dict, existing)
     
