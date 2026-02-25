@@ -75,6 +75,9 @@ SKIP_DIRS = {
     'dist', 'build', '.next', 'target', 'vendor', '.cargo',
 }
 
+# Additional dirs to skip when --no-scripts is used
+SCRIPT_DIRS = {'scripts', 'script', 'test', 'tests', '__tests__', 'spec', 'e2e'}
+
 # Common env var categories
 CATEGORIES = {
     'database': ['DATABASE', 'DB_', 'POSTGRES', 'MYSQL', 'MONGO', 'REDIS', 'SQL'],
@@ -88,6 +91,18 @@ CATEGORIES = {
 
 # Keywords that indicate sensitive variables
 SENSITIVE_KEYWORDS = {'SECRET', 'KEY', 'PASSWORD', 'TOKEN', 'CREDENTIAL', 'PRIVATE', 'AUTH'}
+
+# Shell built-ins and common false positives to skip
+SKIP_VARS = {
+    'HOME', 'PATH', 'USER', 'SHELL', 'PWD', 'TERM', 'LANG', 'LC_ALL',
+    'BASH_SOURCE', 'BASH_LINENO', 'FUNCNAME', 'LINENO', 'RANDOM', 'SECONDS',
+    'IFS', 'PS1', 'PS2', 'PS4', 'OLDPWD', 'HOSTNAME', 'HOSTTYPE', 'OSTYPE',
+    'UID', 'EUID', 'GROUPS', 'PPID', 'SHELLOPTS', 'BASHOPTS',
+    # Color codes in scripts
+    'RED', 'GREEN', 'YELLOW', 'BLUE', 'PURPLE', 'CYAN', 'WHITE', 'NC', 'RESET', 'BOLD',
+    # Common script variables
+    'SCRIPT_DIR', 'PROJECT_ROOT', 'DIR', 'ROOT', 'BASE_DIR',
+}
 
 
 def is_sensitive(var_name: str) -> bool:
@@ -193,13 +208,16 @@ def scan_file(filepath: Path) -> Dict[str, Dict]:
                 # Skip very short names or common false positives
                 if len(var_name) < 3:
                     continue
-                if var_name in {'HOME', 'PATH', 'USER', 'SHELL', 'PWD', 'TERM'}:
+                if var_name in SKIP_VARS:
                     continue
                 
                 # Extract default value if pattern supports it
                 default_value = None
                 if default_group and len(match.groups()) >= default_group:
-                    default_value = match.group(default_group)
+                    raw_default = match.group(default_group)
+                    # Skip shell command substitutions as defaults
+                    if raw_default and not raw_default.startswith('$(') and not raw_default.startswith('`'):
+                        default_value = raw_default
                 
                 if var_name not in results:
                     results[var_name] = {
@@ -216,13 +234,15 @@ def scan_file(filepath: Path) -> Dict[str, Dict]:
     return results
 
 
-def scan_directory(root: Path) -> Dict[str, Dict]:
+def scan_directory(root: Path, skip_scripts: bool = False) -> Dict[str, Dict]:
     """Scan a directory for all env var references."""
     all_vars = {}
     
+    skip_set = SKIP_DIRS | (SCRIPT_DIRS if skip_scripts else set())
+    
     for dirpath, dirnames, filenames in os.walk(root):
         # Skip ignored directories
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        dirnames[:] = [d for d in dirnames if d not in skip_set]
         
         for filename in filenames:
             filepath = Path(dirpath) / filename
@@ -435,6 +455,8 @@ def main():
     parser.add_argument('--check', action='store_true', help='Check mode: exit 1 if undocumented vars exist')
     parser.add_argument('--format', choices=['env', 'typescript', 'zod'], default='env',
                         help='Output format (default: env)')
+    parser.add_argument('--no-scripts', action='store_true',
+                        help='Skip scripts/, test/, tests/ directories')
     
     args = parser.parse_args()
     root = Path(args.path).resolve()
@@ -449,7 +471,7 @@ def main():
     if not quiet:
         print(f"Scanning {root}...", file=sys.stderr)
     
-    vars_dict = scan_directory(root)
+    vars_dict = scan_directory(root, skip_scripts=args.no_scripts)
     existing = check_existing_env(root)
     
     if not quiet:
