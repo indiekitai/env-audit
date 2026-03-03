@@ -1,3 +1,5 @@
+[English](README.md) | [中文](README.zh-CN.md)
+
 # env-audit
 
 Scan a codebase for environment variables and generate a documented `.env.example`.
